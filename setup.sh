@@ -10,7 +10,8 @@ git add .envrc
 git add .gitignore
 git add flake.nix
 git commit -m "Init"
-git branch -d master
+
+git branch -D master
 git branch -m master
 
 rm setup.sh
