@@ -1,5 +1,9 @@
 [package]
-name = "PROJECT_NAME"
+name = "rpi-sd-cloner"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+rppal = "0.22.1"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
