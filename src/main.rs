@@ -26,6 +26,8 @@ const BUTTON_GPIO: u8 = 26;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemState {
+    /// Initializing
+    Initializing,
     /// An SD card needs to be inserted
     NoSdCard,
     /// We found an SD card
@@ -52,6 +54,7 @@ enum LedState {
 impl Into<LedState> for SystemState {
     fn into(self) -> LedState {
         match self {
+            Self::Initializing => LedState::SolidBoth,
             Self::NoSdCard => LedState::FlashingRed,
             Self::SdCardFound => LedState::FlashingGreen,
             Self::Flashing => LedState::FlashingGreenRed,
@@ -152,9 +155,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let red = Gpio::new()?.get(LED_RED)?.into_output();
     let yellow = Gpio::new()?.get(LED_YELLOW)?.into_output();
 
-    let (state_sender, system_state) = watch::channel(SystemState::NoSdCard);
+    let (state_sender, system_state) = watch::channel(SystemState::Initializing);
     let driver = LedDriver::new(red, yellow, system_state.clone());
     let _led_jh = tokio::spawn(async move { driver.update_loop().await });
+
+    let expected_digest = sha256::try_digest("disk_image.img")?;
 
     let button_gpio = Gpio::new()?.get(BUTTON_GPIO)?.into_input_pullup();
 
@@ -192,7 +197,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
 
-                println!("Have devices: {devices:?}");
                 device_path = devices.get(0).cloned();
                 device_path = device_path
                     .and_then(|path| path.to_str().map(|inner| inner.to_string()))
@@ -211,7 +215,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     state_sender.send_replace(SystemState::NoSdCard);
                     continue;
                 };
-                if std::fs::exists(device_path).ok().is_none_or(|path| !path) {
+                if !block_device_valid(device_path.to_string_lossy().to_string()) {
                     state_sender.send_replace(SystemState::NoSdCard);
                 }
 
@@ -230,7 +234,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 match destination_file {
                     Ok(destination_file) => {
                         let mut reader = BufReader::new(source_file.try_clone()?);
-                        let mut writer = BufWriter::new(destination_file);
+                        let mut writer = BufWriter::new(destination_file.try_clone()?);
 
                         let clone_result: std::io::Result<()> = (|| {
                             copy(&mut reader, &mut writer)?;
@@ -240,7 +244,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         })();
                         match clone_result {
                             Ok(()) => {
-                                state_sender.send_replace(SystemState::FlashingSuceeded);
+                                println!("Verifying that checksum matches");
+                                let digest = sha256::try_digest(device_path);
+                                println!("Digest is {digest:?}");
+                                if let Ok(digest) = digest {
+                                    if digest == expected_digest {
+                                        state_sender.send_replace(SystemState::FlashingSuceeded);
+                                    }
+                                }
                             }
                             Err(error) => {
                                 println!("Got error when copying files: {error:?}");
@@ -261,8 +272,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     state_sender.send_replace(SystemState::NoSdCard);
                 }
             }
+            SystemState::Initializing => {
+                state_sender.send_replace(SystemState::NoSdCard);
+            }
         };
     }
+}
+
+fn block_device_valid(path: String) -> bool {
+    let mut path = path.replace("/dev/", "/sys/block/");
+    path.push_str("/size");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|string| string.trim().parse::<u64>().ok())
+        .is_some_and(|sectors| sectors > 0)
 }
 
 /*
