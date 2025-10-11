@@ -9,11 +9,10 @@
 // handle incoming signals to prevent an abnormal termination.
 
 use std::error::Error;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::fs::File;
-use std::io::{self, copy, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use rppal::gpio::Gpio;
 
@@ -40,6 +39,7 @@ enum SystemState {
     FlashingFailed,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LedState {
     Off,
@@ -150,7 +150,8 @@ impl LedDriver {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let source_file = File::open("disk_image.img")?;
+    let source_path = "disk_image.img";
+    let source_file = File::open(&source_path)?;
 
     let red = Gpio::new()?.get(LED_RED)?.into_output();
     let yellow = Gpio::new()?.get(LED_YELLOW)?.into_output();
@@ -159,7 +160,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let driver = LedDriver::new(red, yellow, system_state.clone());
     let _led_jh = tokio::spawn(async move { driver.update_loop().await });
 
-    let expected_digest = sha256::try_digest("disk_image.img")?;
+    let source_bytes = {
+        let mut reader = BufReader::new(source_file);
+        reader.seek(SeekFrom::End(0))? as usize
+    };
 
     let button_gpio = Gpio::new()?.get(BUTTON_GPIO)?.into_input_pullup();
 
@@ -230,28 +234,83 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
                 println!("Have device! {device_path:?}. Flashing");
-                let destination_file = File::options().write(true).open(device_path);
+                let destination_file = File::options()
+                    .write(true)
+                    .truncate(true)
+                    .read(true)
+                    .open(device_path);
+
                 match destination_file {
                     Ok(destination_file) => {
+                        let source_file = File::open(source_path)?;
                         let mut reader = BufReader::new(source_file.try_clone()?);
                         let mut writer = BufWriter::new(destination_file.try_clone()?);
 
-                        let clone_result: std::io::Result<()> = (|| {
-                            copy(&mut reader, &mut writer)?;
-                            writer.flush()?;
-                            writer.into_inner()?.sync_all()?;
+                        const BUFFER_SIZE: usize = 128 * 1024 * 1024;
+
+                        // Copy in chunks of 64M
+                        let mut copy_buffer: Box<[u8]> = vec![0; BUFFER_SIZE].into_boxed_slice();
+
+                        let mut hasher = DefaultHasher::new();
+                        let copy_func = || {
+                            let mut hashes = vec![];
+                            let mut read_bytes = 0;
+                            loop {
+                                let read = reader.read(copy_buffer.as_mut())?;
+                                if read_bytes == source_bytes {
+                                    break;
+                                }
+                                read_bytes += read;
+                                println!("Read {read_bytes}/{source_bytes}");
+                                let copied_buffer = &copy_buffer[..read];
+                                let hash = copied_buffer.hash(&mut hasher);
+                                hashes.push(hash);
+                                writer.write_all(copied_buffer)?;
+                                writer.flush()?;
+                            }
+                            println!("Written bytes, reading back to verify. Bytes written = {read_bytes}");
+                            let mut hashes = hashes.into_iter();
+                            let mut reader = BufReader::new(writer.into_inner()?);
+                            let mut bytes_remaining = read_bytes;
+                            loop {
+                                let bytes_to_read = BUFFER_SIZE.min(bytes_remaining);
+                                if bytes_to_read == 0 {
+                                    break;
+                                }
+                                let read =
+                                    reader.read(&mut copy_buffer.as_mut()[..bytes_to_read])?;
+                                if read == 0 {
+                                    println!("Somehow read 0 bytes, with bytes remaining");
+                                }
+                                bytes_remaining = bytes_remaining.checked_sub(read).ok_or(
+                                    std::io::Error::new(
+                                        ErrorKind::Other,
+                                        "Somehow read more bytes than we could",
+                                    ),
+                                )?;
+                                let copied_buffer = &copy_buffer[..read];
+                                let hash = copied_buffer.hash(&mut hasher);
+                                if hash
+                                    != hashes.next().ok_or(std::io::Error::new(
+                                        ErrorKind::Other,
+                                        "Read more bytes than wrote",
+                                    ))?
+                                {
+                                    return Err(std::io::Error::new(
+                                        ErrorKind::Other,
+                                        "Hashes don't match",
+                                    ));
+                                }
+                            }
+                            println!("All hashes checked, and matched");
                             Ok(())
-                        })();
+                        };
+
+                        let clone_result: std::io::Result<()> = copy_func();
+
                         match clone_result {
                             Ok(()) => {
-                                println!("Verifying that checksum matches");
-                                let digest = sha256::try_digest(device_path);
-                                println!("Digest is {digest:?}");
-                                if let Ok(digest) = digest {
-                                    if digest == expected_digest {
-                                        state_sender.send_replace(SystemState::FlashingSuceeded);
-                                    }
-                                }
+                                state_sender.send_replace(SystemState::FlashingSuceeded);
                             }
                             Err(error) => {
                                 println!("Got error when copying files: {error:?}");
@@ -267,6 +326,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 button_receiver.mark_unchanged();
             }
             SystemState::FlashingFailed | SystemState::FlashingSuceeded => {
+                if device_path.as_ref().is_none_or(|device_path| {
+                    !block_device_valid(device_path.to_string_lossy().to_string())
+                }) {
+                    state_sender.send_replace(SystemState::NoSdCard);
+                }
                 if button_receiver.has_changed()? {
                     button_receiver.mark_unchanged();
                     state_sender.send_replace(SystemState::NoSdCard);
@@ -308,6 +372,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 */
 use std::fs;
+use std::hash::{DefaultHasher, Hash};
 use std::path::{Path, PathBuf};
 
 fn get_block_devices_with_size(min_size_bytes: u64) -> io::Result<Vec<PathBuf>> {

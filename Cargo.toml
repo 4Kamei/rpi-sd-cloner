@@ -5,6 +5,5 @@ edition = "2021"
 
 [dependencies]
 rppal = "0.22.1"
-sha256 = "1.6.0"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
