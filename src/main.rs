@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let red = Gpio::new()?.get(LED_RED)?.into_output();
     let yellow = Gpio::new()?.get(LED_YELLOW)?.into_output();
 
-    let (sender, system_state) = watch::channel(SystemState::NoSdCard);
+    let (state_sender, system_state) = watch::channel(SystemState::NoSdCard);
     let driver = LedDriver::new(red, yellow, system_state.clone());
     let _led_jh = tokio::spawn(async move { driver.update_loop().await });
 
@@ -184,10 +184,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
                 println!("Have devices: {devices:?}");
-                device_path = devices.get(0);
-                sender.send_replace(SystemState::SdCardFound);
+                device_path = devices.get(0).cloned();
+                state_sender.send_replace(SystemState::SdCardFound);
             }
-            SystemState::SdCardFound => {}
+            SystemState::SdCardFound => {
+                let Some(ref device_path) = device_path else {
+                    state_sender.send_replace(SystemState::NoSdCard);
+                    continue;
+                };
+                println!("Have device! {device_path:?}");
+            }
             SystemState::Flashing => {}
             SystemState::FlashingFailed => {}
             SystemState::FlashingSuceeded => {}
