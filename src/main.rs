@@ -13,16 +13,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use std::fs::File;
-use std::io::{self, copy, BufReader, BufWriter};
+use std::io::{self, copy, BufReader, BufWriter, Write};
 
 use rppal::gpio::Gpio;
 
 type WhateverResult = Result<(), Box<dyn Error + Send>>;
 
 // Gpio uses BCM pin numbering. BCM GPIO 23 is tied to physical pin 16.
-const LED_YELLOW: u8 = 27;
-const LED_RED: u8 = 23;
-const BUTTON_GPIO: u8 = 10;
+const LED_YELLOW: u8 = 23;
+const LED_RED: u8 = 27;
+const BUTTON_GPIO: u8 = 26;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemState {
@@ -100,8 +100,12 @@ impl LedDriver {
         loop {
             tokio::select! {
                 _ = receiver.changed() => {
-                    led_state = receiver.borrow_and_update().clone().into();
-                    flash_state = false;
+                    let new_led_state = receiver.borrow_and_update().clone().into();
+                    println!("Got new led state: {new_led_state:?}");
+                    if new_led_state != led_state {
+                        led_state = new_led_state;
+                        flash_state = false;
+                    }
                 }
                 _ = timer.tick() => {
                     flash_state = !flash_state;
@@ -143,6 +147,8 @@ impl LedDriver {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let source_file = File::open("disk_image.img")?;
+
     let red = Gpio::new()?.get(LED_RED)?.into_output();
     let yellow = Gpio::new()?.get(LED_YELLOW)?.into_output();
 
@@ -162,6 +168,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let current_state = button_gpio.is_low();
 
             if [last_state, current_state] == [false, true] {
+                println!("Button is pressed");
                 sender.send_replace(());
             }
             last_state = current_state;
@@ -171,10 +178,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut device_path = None;
 
     loop {
+        println!("Current state is: {:?}", system_state.borrow());
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match system_state.borrow().clone() {
+        let current_state: SystemState = system_state.borrow().clone();
+        //Get all devices that are at least 128 GB
+        match current_state {
             SystemState::NoSdCard => {
-                //Get all devices that are at least 128 GB
                 let devices = get_block_devices_with_size(128 * 1000 * 1000 * 1000);
                 let Ok(devices) = devices else {
                     println!(
@@ -183,9 +192,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                     continue;
                 };
+
                 println!("Have devices: {devices:?}");
                 device_path = devices.get(0).cloned();
-                state_sender.send_replace(SystemState::SdCardFound);
+                device_path = device_path
+                    .and_then(|path| path.to_str().map(|inner| inner.to_string()))
+                    .map(|path_string| PathBuf::from(path_string.replace("/sys/block/", "/dev/")));
+
+                if device_path.is_none() {
+                    state_sender.send_replace(SystemState::NoSdCard);
+                } else {
+                    state_sender.send_replace(SystemState::SdCardFound);
+                    button_receiver.mark_unchanged();
+                }
             }
             SystemState::SdCardFound => {
                 let Some(ref device_path) = device_path else {
@@ -193,10 +212,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
                 println!("Have device! {device_path:?}");
+                if std::fs::exists(device_path).ok().is_none_or(|path| !path) {
+                    state_sender.send_replace(SystemState::NoSdCard);
+                }
+
+                if button_receiver.has_changed()? {
+                    button_receiver.mark_unchanged();
+                    state_sender.send_replace(SystemState::Flashing);
+                }
             }
-            SystemState::Flashing => {}
-            SystemState::FlashingFailed => {}
-            SystemState::FlashingSuceeded => {}
+            SystemState::Flashing => {
+                let Some(ref device_path) = device_path else {
+                    state_sender.send_replace(SystemState::FlashingFailed);
+                    continue;
+                };
+                println!("Have device! {device_path:?}. Flashing");
+                let destination_file = File::options().write(true).open(device_path);
+                match destination_file {
+                    Ok(destination_file) => {
+                        let mut reader = BufReader::new(source_file.try_clone()?);
+                        let mut writer = BufWriter::new(destination_file);
+
+                        let clone_result: std::io::Result<()> = (|| {
+                            copy(&mut reader, &mut writer)?;
+                            writer.flush()?;
+                            writer.into_inner()?.sync_all()?;
+                            Ok(())
+                        })();
+                        match clone_result {
+                            Ok(()) => {
+                                state_sender.send_replace(SystemState::FlashingSuceeded);
+                            }
+                            Err(error) => {
+                                println!("Got error when copying files: {error:?}");
+                                state_sender.send_replace(SystemState::FlashingFailed);
+                            }
+                        }
+                    }
+                    Err(file_opening_error) => {
+                        println!("Got error when opening file: {file_opening_error:?}");
+                        state_sender.send_replace(SystemState::FlashingFailed);
+                    }
+                }
+                button_receiver.mark_unchanged();
+            }
+            SystemState::FlashingFailed | SystemState::FlashingSuceeded => {
+                println!("Waiting for button; {button_receiver:?}");
+                if button_receiver.has_changed()? {
+                    button_receiver.mark_unchanged();
+                    state_sender.send_replace(SystemState::NoSdCard);
+                }
+            }
         };
     }
 }
