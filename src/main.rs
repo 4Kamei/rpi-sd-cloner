@@ -101,8 +101,8 @@ impl LedDriver {
             tokio::select! {
                 _ = receiver.changed() => {
                     let new_led_state = receiver.borrow_and_update().clone().into();
-                    println!("Got new led state: {new_led_state:?}");
                     if new_led_state != led_state {
+                        println!("Got new led state: {new_led_state:?}");
                         led_state = new_led_state;
                         flash_state = false;
                     }
@@ -178,7 +178,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut device_path = None;
 
     loop {
-        println!("Current state is: {:?}", system_state.borrow());
         tokio::time::sleep(Duration::from_millis(50)).await;
         let current_state: SystemState = system_state.borrow().clone();
         //Get all devices that are at least 128 GB
@@ -202,6 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if device_path.is_none() {
                     state_sender.send_replace(SystemState::NoSdCard);
                 } else {
+                    println!("Have device! {device_path:?}");
                     state_sender.send_replace(SystemState::SdCardFound);
                     button_receiver.mark_unchanged();
                 }
@@ -211,7 +211,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     state_sender.send_replace(SystemState::NoSdCard);
                     continue;
                 };
-                println!("Have device! {device_path:?}");
                 if std::fs::exists(device_path).ok().is_none_or(|path| !path) {
                     state_sender.send_replace(SystemState::NoSdCard);
                 }
@@ -257,7 +256,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 button_receiver.mark_unchanged();
             }
             SystemState::FlashingFailed | SystemState::FlashingSuceeded => {
-                println!("Waiting for button; {button_receiver:?}");
                 if button_receiver.has_changed()? {
                     button_receiver.mark_unchanged();
                     state_sender.send_replace(SystemState::NoSdCard);
