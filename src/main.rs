@@ -22,6 +22,7 @@ type WhateverResult = Result<(), Box<dyn Error + Send>>;
 // Gpio uses BCM pin numbering. BCM GPIO 23 is tied to physical pin 16.
 const LED_YELLOW: u8 = 27;
 const LED_RED: u8 = 23;
+const BUTTON_GPIO: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemState {
@@ -145,28 +146,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let red = Gpio::new()?.get(LED_RED)?.into_output();
     let yellow = Gpio::new()?.get(LED_YELLOW)?.into_output();
 
-    let (sender, receiver) = watch::channel(SystemState::NoSdCard);
+    let (sender, system_state) = watch::channel(SystemState::NoSdCard);
+    let driver = LedDriver::new(red, yellow, system_state.clone());
+    let _led_jh = tokio::spawn(async move { driver.update_loop().await });
 
-    let driver = LedDriver::new(red, yellow, receiver.clone());
-    let jh = tokio::spawn(async move { driver.update_loop().await });
+    let button_gpio = Gpio::new()?.get(BUTTON_GPIO)?.into_input_pullup();
 
-    let system_state = [
-        SystemState::NoSdCard,
-        SystemState::SdCardFound,
-        SystemState::Flashing,
-        SystemState::FlashingSuceeded,
-        SystemState::FlashingFailed,
-    ];
+    let (sender, mut button_receiver) = watch::channel(());
+    button_receiver.mark_unchanged();
+    let _button_jh = tokio::spawn(async move {
+        let mut last_state = button_gpio.is_low();
+        loop {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            // Button is pressed.
+            let current_state = button_gpio.is_low();
 
-    let mut state = system_state.into_iter();
+            if [last_state, current_state] == [false, true] {
+                sender.send_replace(());
+            }
+            last_state = current_state;
+        }
+    });
+
+    let mut device_path = None;
 
     loop {
-        sender.send(state.next().ok_or("Ran out of values")?)?;
-        println!("Current state is {:?}", receiver.borrow());
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match system_state.borrow().clone() {
+            SystemState::NoSdCard => {
+                //Get all devices that are at least 128 GB
+                let devices = get_block_devices_with_size(128 * 1000 * 1000 * 1000);
+                let Ok(devices) = devices else {
+                    println!(
+                        "Got error when querying devices: {:?}",
+                        devices.unwrap_err()
+                    );
+                    continue;
+                };
+                println!("Have devices: {devices:?}");
+                device_path = devices.get(0);
+                sender.send_replace(SystemState::SdCardFound);
+            }
+            SystemState::SdCardFound => {}
+            SystemState::Flashing => {}
+            SystemState::FlashingFailed => {}
+            SystemState::FlashingSuceeded => {}
+        };
     }
-
-    Ok(())
 }
 
 /*
@@ -189,34 +215,34 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 */
 use std::fs;
-use std::path::Path;
-use tokio::time::Interval;
+use std::path::{Path, PathBuf};
 
-fn get_block_devices_with_size(min_size_bytes: u64) -> io::Result<()> {
+fn get_block_devices_with_size(min_size_bytes: u64) -> io::Result<Vec<PathBuf>> {
     let block_path = Path::new("/sys/block");
 
-    for entry in fs::read_dir(block_path)? {
-        let entry = entry?;
-        let dev_name = entry.file_name().into_string().unwrap();
-        let size_path = entry.path().join("size");
-
-        if size_path.exists() {
-            let size_str = fs::read_to_string(&size_path)?.trim().to_string();
-
-            if let Ok(sectors) = size_str.parse::<u64>() {
-                let size_bytes = sectors * 512;
-
-                if size_bytes >= min_size_bytes {
-                    println!(
-                        "/dev/{} - {} bytes ({:.2} GB)",
-                        dev_name,
-                        size_bytes,
-                        size_bytes as f64 / 1_073_741_824.0
-                    );
+    Ok(fs::read_dir(block_path)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path().join("size");
+            if path.exists() {
+                let size = fs::read_to_string(&path).ok()?.trim().to_string();
+                match size.parse::<u64>() {
+                    Ok(size_blocks) => Some((entry, size_blocks * 512)),
+                    Err(error) => {
+                        println!("Got error when parsing path: {entry:?}. Error={error:?}");
+                        None
+                    }
                 }
+            } else {
+                None
             }
-        }
-    }
-
-    Ok(())
+        })
+        .filter_map(|(entry, size)| {
+            if size < min_size_bytes {
+                None
+            } else {
+                Some(entry.path())
+            }
+        })
+        .collect())
 }
